@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ezlive - P2P 화상 및 파일 공유</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- PeerJS CDN -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        /* Custom styles for video elements */
+        .video-container {
+            width: 100%;
+            height: 400px;
+            display: flex;
+            gap: 1rem;
+        }
+        video {
+            width: 50%;
+            height: 100%;
+            object-fit: cover;
+            background-color: #1f2937; /* dark gray background */
+        }
+        /* Mobile adjustments */
+        @media (max-width: 768px) {
+            .video-container {
+                flex-direction: column;
+                height: auto;
+            }
+            video {
+                width: 100%;
+                height: 200px;
+            }
+        }
+        /* Style for progress bar (optional, Tailwind doesn't style native progress well) */
+        progress {
+            /* Tailwind equivalent styles for a visible progress bar */
+            appearance: none;
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            border: none;
+            border-radius: 9999px; /* rounded-full */
+            height: 8px; /* h-2 */
+        }
+        progress::-webkit-progress-bar {
+            background-color: #e5e7eb; /* bg-gray-200 */
+            border-radius: 9999px;
+        }
+        progress::-webkit-progress-value {
+            background-color: #3b82f6; /* bg-blue-500 */
+            border-radius: 9999px;
+        }
+        progress::-moz-progress-bar {
+            background-color: #3b82f6;
+            border-radius: 9999px;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen p-4 md:p-8 font-sans">
+
+    <!-- Main Container -->
+    <div id="app" class="max-w-4xl mx-auto bg-white shadow-xl rounded-xl p-6 md:p-10">
+        <h1 class="text-3xl md:text-4xl font-extrabold text-blue-600 mb-6 text-center">
+            ezlive P2P 화상 및 파일 공유
+        </h1>
+
+        <!-- Status Message Box -->
+        <div id="status-box" class="p-3 mb-6 rounded-lg text-sm transition-all duration-300 hidden"></div>
+
+        <!-- Dynamic Content Area -->
+        <div id="content">
+            <!-- Content will be rendered here by JavaScript -->
+        </div>
+
+        <!-- Modal for Custom Messages (instead of alert) -->
+        <div id="modal-overlay" class="fixed inset-0 bg-gray-900 bg-opacity-75 z-50 hidden items-center justify-center">
+            <div class="bg-white p-6 rounded-lg shadow-2xl max-w-sm w-full">
+                <h3 id="modal-title" class="text-xl font-bold mb-3 text-red-600">오류</h3>
+                <p id="modal-message" class="text-gray-700 mb-6">메시지 내용</p>
+                <button onclick="hideModal()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 rounded-lg transition duration-150">확인</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase SDK Imports (Required for environment, though not used for P2P logic) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth;
+
+        async function initFirebase() {
+            try {
+                if (Object.keys(firebaseConfig).length > 0) {
+                    setLogLevel('debug');
+                    app = initializeApp(firebaseConfig);
+                    auth = getAuth(app);
+                    db = getFirestore(app);
+
+                    // Authenticate
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                        console.log("Firebase: Signed in with custom token.");
+                    } else {
+                        await signInAnonymously(auth);
+                        console.log("Firebase: Signed in anonymously.");
+                    }
+
+                    // Set global userId after auth
+                    window.currentUserId = auth.currentUser?.uid || 'anonymous';
+                    console.log("Current User ID:", window.currentUserId);
+                } else {
+                    console.warn("Firebase: Config not found. Proceeding without Firebase services.");
+                }
+            } catch (error) {
+                console.error("Firebase Initialization Error:", error);
+            }
+        }
+
+        initFirebase();
+    </script>
+
+    <script>
+        // --- Global State and PeerJS Setup ---
+        let currentView = 'start'; // 'start', 'host_display', 'client_connect', 'chat'
+        let peer = null;
+        let myId = null;
+        let remoteId = null;
+
+        // Media Stream State
+        let myStream = null;
+        let remoteStream = null;
+        let isVideoEnabled = true;
+        let isAudioEnabled = true;
+
+        // Data Channel State (for file sharing)
+        let dataConnection = null;
+        const CHUNK_SIZE = 16 * 1024; // 16KB chunk size for DataChannel
+        let receivingFile = {}; // State for file currently being received
+
+        let peerConfig = {
+            // Using the default PeerJS cloud server
+            host: '0.peerjs.com',
+            port: 443,
+            secure: true
+        };
+
+        const contentDiv = document.getElementById('content');
+        const statusBox = document.getElementById('status-box');
+        const modalOverlay = document.getElementById('modal-overlay');
+        const modalTitle = document.getElementById('modal-title');
+        const modalMessage = document.getElementById('modal-message');
+
+        // --- Utility Functions ---
+
+        function showModal(title, message, isError = true) {
+            modalTitle.textContent = title;
+            modalMessage.textContent = message;
+            modalTitle.className = isError ? 'text-xl font-bold mb-3 text-red-600' : 'text-xl font-bold mb-3 text-green-600';
+            modalOverlay.classList.remove('hidden');
+            modalOverlay.classList.add('flex');
+        }
+
+        function hideModal() {
+            modalOverlay.classList.add('hidden');
+            modalOverlay.classList.remove('flex');
+        }
+
+        function updateStatus(message, type = 'info') {
+            statusBox.textContent = message;
+            statusBox.classList.remove('hidden', 'bg-red-100', 'text-red-700', 'bg-green-100', 'text-green-700', 'bg-yellow-100', 'text-yellow-700', 'bg-blue-100', 'text-blue-700');
+            statusBox.classList.add('p-3', 'mb-6', 'text-sm');
+
+            if (type === 'error') {
+                statusBox.classList.add('bg-red-100', 'text-red-700');
+            } else if (type === 'success') {
+                statusBox.classList.add('bg-green-100', 'text-green-700');
+            } else if (type === 'warning') {
+                statusBox.classList.add('bg-yellow-100', 'text-yellow-700');
+            } else {
+                statusBox.classList.add('bg-blue-100', 'text-blue-700');
+            }
+        }
+
+        function render() {
+            contentDiv.innerHTML = '';
+            updateStatus("--- 상태 대기 중 ---", 'info');
+
+            if (currentView === 'start') {
+                renderStartView();
+            } else if (currentView === 'host_display') {
+                renderHostDisplayView();
+            } else if (currentView === 'client_connect') {
+                renderClientConnectView();
+            } else if (currentView === 'chat') {
+                renderChatView();
+            }
+        }
+
+        // --- Media Control Functions ---
+        function toggleVideo() {
+            if (!myStream) return;
+            isVideoEnabled = !isVideoEnabled;
+            myStream.getVideoTracks().forEach(track => track.enabled = isVideoEnabled);
+            
+            const btn = document.getElementById('toggle-video-btn');
+            btn.innerHTML = isVideoEnabled 
+                ? '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-video"><path d="m22 8-6 4 6 4V8Z"/><path d="M14 5H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Z"/></svg>'
+                : '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-video-off"><path d="M10.36 12.86L2.94 5.44M2 12v3a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2h-3.14M22 7l-5.46 3.42a1 1 0 0 1-1.12-.13l-4.22-3.37L10.36 12.86M2 2l20 20"/></svg>';
+
+            btn.title = isVideoEnabled ? '비디오 끄기' : '비디오 켜기';
+            btn.classList.toggle('bg-red-500', !isVideoEnabled);
+            btn.classList.toggle('bg-green-500', isVideoEnabled);
+
+            updateStatus(isVideoEnabled ? "비디오가 켜졌습니다." : "비디오가 꺼졌습니다.", isVideoEnabled ? 'success' : 'info');
+        }
+
+        function toggleAudio() {
+            if (!myStream) return;
+            isAudioEnabled = !isAudioEnabled;
+            myStream.getAudioTracks().forEach(track => track.enabled = isAudioEnabled);
+
+            const btn = document.getElementById('toggle-audio-btn');
+            btn.innerHTML = isAudioEnabled
+                ? '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-mic"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>'
+                : '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-mic-off"><line x1="2" x2="22" y1="2" y2="22"></line><path d="M19 5v4"></path><path d="M22 10a10 10 0 0 1-8.5 9.87"></path><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M9 10v2a3 3 0 0 0 6 0v-2"></path><line x1="5" x2="5" y1="10" y2="15"></line><line x1="19" x2="19" y1="18" y2="15"></line></svg>';
+            
+            btn.title = isAudioEnabled ? '마이크 끄기' : '마이크 켜기';
+            btn.classList.toggle('bg-red-500', !isAudioEnabled);
+            btn.classList.toggle('bg-green-500', isAudioEnabled);
+
+            updateStatus(isAudioEnabled ? "마이크가 켜졌습니다." : "마이크가 꺼졌습니다.", isAudioEnabled ? 'success' : 'info');
+        }
+
+
+        // --- File Transfer Functions ---
+        function sendFile() {
+            const fileInput = document.getElementById('file-input');
+            const file = fileInput.files[0];
+            const statusText = document.getElementById('file-transfer-status');
+
+            if (!file || !dataConnection || !dataConnection.open) {
+                updateStatus("파일을 선택하거나 연결을 확인해주세요.", 'error');
+                return;
+            }
+
+            // Enforce 100MB limit (100 * 1024 * 1024 bytes)
+            if (file.size > 100 * 1048576) {
+                showModal("용량 초과", `파일은 최대 100MB까지만 전송할 수 있습니다. (현재 ${Math.ceil(file.size / 1048576)}MB)`, true);
+                return;
+            }
+
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            let offset = 0;
+
+            // 1. Send file metadata (JSON string)
+            const metadata = {
+                fileName: file.name,
+                fileSize: file.size,
+                fileType: file.type,
+                totalChunks: totalChunks,
+                type: 'file-meta'
+            };
+            dataConnection.send(JSON.stringify(metadata));
+
+            statusText.textContent = `[${file.name}] 전송 시작... (0%)`;
+            statusText.classList.remove('hidden');
+            document.getElementById('send-file-btn').disabled = true;
+            fileInput.disabled = true;
+
+            // 2. Start sending chunks (ArrayBuffer)
+            function sendNextChunk() {
+                // Ensure data channel is ready before sending
+                if (dataConnection.bufferedAmount > 1024 * 1024 * 10) { // Limit buffer to prevent memory issues
+                    setTimeout(sendNextChunk, 50);
+                    return;
+                }
+
+                const end = Math.min(offset + CHUNK_SIZE, file.size);
+                const chunk = file.slice(offset, end);
+
+                dataConnection.send(chunk);
+
+                offset = end;
+                const percent = Math.round((offset / file.size) * 100);
+                statusText.textContent = `[${file.name}] 전송 중... (${percent}%)`;
+
+                if (offset < file.size) {
+                    // Use setTimeout to yield execution and prevent freezing the UI
+                    setTimeout(sendNextChunk, 10);
+                } else {
+                    // 3. Send transfer complete signal
+                    dataConnection.send(JSON.stringify({ type: 'file-end', fileName: file.name }));
+                    statusText.textContent = `[${file.name}] 전송 완료!`;
+                    updateStatus("파일 전송 완료!", 'success');
+                    document.getElementById('send-file-btn').disabled = false;
+                    fileInput.disabled = false;
+                    fileInput.value = ''; // Clear file input
+                }
+            }
+
+            sendNextChunk();
+        }
+
+        function setupDataConnectionEvents(conn) {
+            dataConnection = conn;
+            dataConnection.on('open', () => {
+                updateStatus("데이터 채널 연결 성공. 파일 공유가 가능합니다.", 'success');
+                // Re-enable file input button if a file is already selected
+                if (currentView === 'chat') {
+                    const fileInput = document.getElementById('file-input');
+                    const sendBtn = document.getElementById('send-file-btn');
+                    if (fileInput && fileInput.files.length > 0) {
+                         sendBtn.disabled = false;
+                    }
+                }
+            });
+
+            dataConnection.on('data', (data) => {
+                if (typeof data === 'string') {
+                    try {
+                        const message = JSON.parse(data);
+                        if (message.type === 'file-meta') {
+                            // Start receiving a new file
+                            receivingFile = {
+                                name: message.fileName,
+                                size: message.fileSize,
+                                type: message.fileType,
+                                chunks: [],
+                                receivedSize: 0,
+                                totalChunks: message.totalChunks
+                            };
+                            document.getElementById('file-receive-area').classList.remove('hidden');
+                            document.getElementById('receive-status').innerHTML = `
+                                <strong>${receivingFile.name}</strong> 수신 시작... (0MB / ${(receivingFile.size / 1048576).toFixed(2)}MB)
+                                <progress id="receive-progress" value="0" max="${receivingFile.size}"></progress>
+                            `;
+                            updateStatus(`[${receivingFile.name}] 파일 수신 시작.`, 'warning');
+
+                        } else if (message.type === 'file-end') {
+                            // File transfer complete, assemble and download
+                            const totalBytes = new Blob(receivingFile.chunks, { type: receivingFile.type });
+                            const fileUrl = URL.createObjectURL(totalBytes);
+                            const link = document.createElement('a');
+                            link.href = fileUrl;
+                            link.download = receivingFile.name;
+                            link.textContent = `[다운로드] ${receivingFile.name} (${(totalBytes.size / 1048576).toFixed(2)}MB)`;
+                            link.className = 'block mt-2 text-blue-600 hover:text-blue-800 underline break-all font-semibold';
+
+                            document.getElementById('receive-status').innerHTML = ''; // Clear status
+                            document.getElementById('receive-status').appendChild(link);
+                            updateStatus(`[${receivingFile.name}] 파일 수신 완료! 다운로드하세요.`, 'success');
+
+                            // Clean up
+                            receivingFile = {};
+                        }
+                    } catch (e) {
+                        console.warn("Received non-file JSON string or failed parsing:", data);
+                    }
+                } else if (data instanceof ArrayBuffer && receivingFile.name) {
+                    // Receive file chunk
+                    receivingFile.chunks.push(data);
+                    receivingFile.receivedSize += data.byteLength;
+
+                    const percent = Math.round((receivingFile.receivedSize / receivingFile.size) * 100);
+                    const receivedMB = (receivingFile.receivedSize / 1048576).toFixed(2);
+                    const totalMB = (receivingFile.size / 1048576).toFixed(2);
+
+                    document.getElementById('receive-status').innerHTML = `
+                        <strong>${receivingFile.name}</strong> 수신 중... (${receivedMB}MB / ${totalMB}MB) (${percent}%)
+                        <progress id="receive-progress" value="${receivingFile.receivedSize}" max="${receivingFile.size}"></progress>
+                    `;
+                    document.getElementById('receive-progress').value = receivingFile.receivedSize;
+                }
+            });
+
+            dataConnection.on('close', () => {
+                updateStatus("데이터 채널이 닫혔습니다.", 'warning');
+                dataConnection = null;
+            });
+
+            dataConnection.on('error', (err) => {
+                console.error("DataConnection Error:", err);
+                showModal("데이터 채널 오류", "파일 전송 중 오류 발생: " + err.message, true);
+            });
+        }
+        
+        // --- View Renderers ---
+
+        function renderStartView() {
+            contentDiv.innerHTML = `
+                <div class="space-y-6 text-center">
+                    <p class="text-gray-700 text-lg">P2P 화상 채팅을 시작하는 방법을 선택하세요.</p>
+
+                    <!-- Host Button (Step 1: 내 서버를 만들고) -->
+                    <button onclick="startHostFlow()"
+                        class="w-full md:w-2/3 mx-auto bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-150 transform hover:scale-105">
+                        <span class="text-xl">HOST (방 만들기)</span>
+                        <span class="block text-sm font-normal mt-1">고유 ID를 생성하고 연결을 기다립니다.</span>
+                    </button>
+
+                    <div class="flex items-center justify-center space-x-4">
+                        <hr class="flex-grow border-gray-300">
+                        <span class="text-gray-500">또는</span>
+                        <hr class="flex-grow border-gray-300">
+                    </div>
+
+                    <!-- Client Button (Step 3: 소통 시작 준비) -->
+                    <button onclick="setCurrentView('client_connect')"
+                        class="w-full md:w-2/3 mx-auto bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-150 transform hover:scale-105">
+                        <span class="text-xl">CLIENT (방 참가하기)</span>
+                        <span class="block text-sm font-normal mt-1">Host ID를 입력하고 연결합니다.</span>
+                    </button>
+
+                </div>
+            `;
+        }
+
+        function renderHostDisplayView() {
+            if (!myId) {
+                updateStatus("Host ID가 생성되지 않았습니다. 다시 시작해주세요.", 'error');
+                return;
+            }
+
+            // Step 2: 서버의 주소를 공유해주면
+            contentDiv.innerHTML = `
+                <div class="text-center space-y-6">
+                    <h2 class="text-2xl font-bold text-gray-800">1단계: 서버(Host) 생성 완료!</h2>
+                    <p class="text-lg text-gray-700">이 ID를 상대방에게 공유해주세요:</p>
+
+                    <div class="bg-gray-200 p-4 rounded-lg shadow-inner flex justify-between items-center">
+                        <span id="host-id-display" class="text-2xl md:text-3xl font-mono text-gray-800 break-all">${myId}</span>
+                        <button onclick="copyId('${myId}')" class="bg-blue-500 hover:bg-blue-600 text-white text-sm font-semibold py-2 px-4 rounded-lg ml-4 transition duration-150">
+                            복사
+                        </button>
+                    </div>
+
+                    <p class="text-yellow-600 font-semibold mt-6">
+                        상대방의 연결을 기다리고 있습니다...
+                    </p>
+
+                    <div id="video-previews" class="video-container mt-8 rounded-lg overflow-hidden shadow-lg">
+                        <video id="local-video" autoplay muted playsinline class="rounded-lg shadow-inner" poster="https://placehold.co/600x400/374151/ffffff?text=내+웹캠+준비+중"></video>
+                        <video id="remote-video" playsinline class="rounded-lg shadow-inner" poster="https://placehold.co/600x400/374151/ffffff?text=상대방+연결+대기+중"></video>
+                    </div>
+
+                    <button onclick="resetApp()" class="mt-8 text-sm text-red-500 hover:text-red-700">
+                        연결 끊고 앱 재시작
+                    </button>
+                </div>
+            `;
+            // Attach stream to local video element immediately
+            const localVideo = document.getElementById('local-video');
+            if (localVideo && myStream) {
+                localVideo.srcObject = myStream;
+                updateStatus(`Host ID: ${myId} 생성됨. 상대방의 연결을 기다리세요.`, 'success');
+            } else {
+                 updateStatus(`웹캠/마이크 스트림을 찾을 수 없습니다. (ID: ${myId})`, 'warning');
+            }
+        }
+
+        function renderClientConnectView() {
+            contentDiv.innerHTML = `
+                <div class="space-y-6">
+                    <h2 class="text-2xl font-bold text-gray-800 text-center">3단계 준비: Host 연결</h2>
+                    <p class="text-gray-700 text-center">Host에게 받은 ID를 아래에 입력하고 연결 버튼을 누르세요.</p>
+
+                    <div class="flex flex-col md:flex-row gap-4">
+                        <input type="text" id="remote-id-input" placeholder="Host ID 입력 (예: unique-peer-id)"
+                            class="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 text-gray-700">
+                        <button onclick="connectToHost()"
+                            class="bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-150">
+                            <span id="connect-btn-text">연결 시도</span>
+                        </button>
+                    </div>
+
+                    <button onclick="setCurrentView('start')" class="mt-4 text-sm text-gray-500 hover:text-gray-700 block mx-auto">
+                        &larr; 돌아가기
+                    </button>
+                </div>
+            `;
+            updateStatus("연결할 Host ID를 입력해주세요.", 'info');
+        }
+
+        function renderChatView() {
+            contentDiv.innerHTML = `
+                <div class="text-center space-y-4">
+                    <h2 class="text-2xl font-bold text-green-600">🎉 연결 성공! 실시간 화상 통화 중</h2>
+
+                    <div id="video-streams" class="video-container mt-4 rounded-xl overflow-hidden shadow-2xl">
+                        <video id="local-video" autoplay muted playsinline class="rounded-lg shadow-inner" poster="https://placehold.co/600x400/374151/ffffff?text=내+영상"></video>
+                        <video id="remote-video" autoplay playsinline class="rounded-lg shadow-inner" poster="https://placehold.co/600x400/374151/ffffff?text=상대방+영상"></video>
+                    </div>
+                    
+                    <!-- Media Controls -->
+                    <div class="flex justify-center gap-4 mt-4">
+                        <button id="toggle-video-btn" onclick="toggleVideo()" title="비디오 끄기" class="p-3 rounded-full bg-green-500 hover:bg-green-600 text-white transition duration-150 shadow-lg">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-video"><path d="m22 8-6 4 6 4V8Z"/><path d="M14 5H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Z"/></svg>
+                        </button>
+                        <button id="toggle-audio-btn" onclick="toggleAudio()" title="마이크 끄기" class="p-3 rounded-full bg-green-500 hover:bg-green-600 text-white transition duration-150 shadow-lg">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-mic"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+                        </button>
+                    </div>
+
+                    <!-- File Transfer Section -->
+                    <div class="mt-8 p-4 border rounded-lg bg-gray-50 shadow">
+                        <h3 class="text-xl font-semibold mb-3 text-gray-800">파일 공유 (최대 100MB)</h3>
+                        <input type="file" id="file-input" class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100">
+                        <button onclick="sendFile()" id="send-file-btn" disabled class="mt-3 w-full bg-blue-500 hover:bg-blue-600 text-white font-semibold py-2 rounded-lg transition duration-150 disabled:opacity-50">
+                            파일 보내기
+                        </button>
+                        <p id="file-transfer-status" class="mt-2 text-sm text-blue-600 text-left hidden"></p>
+                        
+                        <!-- Receive Status Area -->
+                        <div id="file-receive-area" class="mt-4 p-2 bg-white border border-dashed rounded-lg hidden text-left">
+                            <p class="font-medium text-gray-700">수신 파일 상태:</p>
+                            <p id="receive-status" class="text-sm text-gray-600"></p>
+                        </div>
+                    </div>
+
+
+                    <p class="text-sm text-gray-500 mt-6">
+                        Local ID: ${myId || 'N/A'} | Remote ID: ${remoteId || 'N/A'}
+                    </p>
+
+                    <button onclick="resetApp()" class="mt-8 text-sm bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg transition duration-150">
+                        통화 종료
+                    </button>
+                </div>
+            `;
+            
+            // Attach streams to video elements
+            const localVideo = document.getElementById('local-video');
+            const remoteVideo = document.getElementById('remote-video');
+
+            if (localVideo && myStream) localVideo.srcObject = myStream;
+            if (remoteVideo && remoteStream) remoteVideo.srcObject = remoteStream;
+
+            // Initial button states
+            if (myStream) {
+                // Initialize isVideoEnabled/isAudioEnabled based on current stream state (which should be true initially)
+                const videoTrack = myStream.getVideoTracks()[0];
+                const audioTrack = myStream.getAudioTracks()[0];
+                isVideoEnabled = videoTrack ? videoTrack.enabled : false;
+                isAudioEnabled = audioTrack ? audioTrack.enabled : false;
+            }
+            // Manually call toggle functions to set correct icons/colors based on initial state
+            // If they are true, calling toggle with the opposite state will set them correctly.
+            if (!isVideoEnabled) toggleVideo();
+            if (!isAudioEnabled) toggleAudio();
+
+
+            // Add listener for file input to enable send button
+            document.getElementById('file-input').addEventListener('change', (e) => {
+                const file = e.target.files[0];
+                const sendBtn = document.getElementById('send-file-btn');
+                const statusText = document.getElementById('file-transfer-status');
+
+                if (file) {
+                    if (file.size <= 100 * 1048576 && dataConnection && dataConnection.open) { // 100MB
+                        sendBtn.disabled = false;
+                        statusText.classList.add('hidden');
+                    } else {
+                        sendBtn.disabled = true;
+                        if (file.size > 100 * 1048576) {
+                            statusText.textContent = `파일 크기가 100MB를 초과합니다. (현재: ${(file.size / 1048576).toFixed(2)}MB)`;
+                            statusText.classList.remove('hidden');
+                            statusText.classList.add('text-red-600');
+                        } else if (!dataConnection || !dataConnection.open) {
+                            statusText.textContent = "데이터 채널 연결 대기 중... 파일을 보낼 수 없습니다.";
+                            statusText.classList.remove('hidden');
+                            statusText.classList.add('text-yellow-600');
+                        }
+                    }
+                } else {
+                    sendBtn.disabled = true;
+                    statusText.classList.add('hidden');
+                }
+            });
+
+            updateStatus("통신이 설정되었습니다. 마이크/비디오 및 파일 공유를 확인하세요.", 'success');
+        }
+
+        // --- Core Application Logic ---
+
+        function copyId(id) {
+            // navigator.clipboard.writeText 대신 document.execCommand('copy')를 사용
+            // iframe 환경에서 클립보드 접근 제한 오류를 우회하기 위함
+            try {
+                const tempInput = document.createElement('input');
+                tempInput.value = id;
+                document.body.appendChild(tempInput);
+                tempInput.select();
+                
+                // execCommand를 사용하여 복사 시도
+                const successful = document.execCommand('copy');
+                document.body.removeChild(tempInput);
+
+                if (successful) {
+                    updateStatus("ID가 클립보드에 복사되었습니다.", 'success');
+                } else {
+                    // execCommand가 실패할 경우 (매우 드묾)
+                    console.error('Copy failed using execCommand.');
+                    showModal("복사 실패", "클립보드 접근이 차단되었습니다. ID를 직접 복사하세요.", false);
+                }
+            } catch (err) {
+                // 예외 처리 (execCommand가 지원되지 않거나 완전히 비활성화된 경우)
+                console.error('Copy failed using execCommand fallback:', err);
+                showModal("복사 실패", "클립보드 접근에 실패했습니다. ID를 직접 복사하세요.", false);
+            }
+        }
+
+        function setCurrentView(view) {
+            currentView = view;
+            render();
+        }
+
+        function resetApp() {
+            if (peer) {
+                peer.destroy();
+                peer = null;
+            }
+            if (myStream) {
+                myStream.getTracks().forEach(track => track.stop());
+                myStream = null;
+            }
+            myId = null;
+            remoteId = null;
+            remoteStream = null;
+            dataConnection = null;
+            receivingFile = {};
+            isVideoEnabled = true;
+            isAudioEnabled = true;
+            setCurrentView('start');
+            updateStatus("앱이 초기화되었습니다.", 'info');
+        }
+
+        async function getMedia() {
+            try {
+                // Get video and audio stream
+                myStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                return myStream;
+            } catch (err) {
+                console.error("Failed to get local stream:", err);
+                showModal("미디어 접근 오류", "웹캠과 마이크 접근 권한을 허용해주세요. (오류: " + err.name + ")", true);
+                return null;
+            }
+        }
+
+        // --- Host/Client PeerJS Handlers ---
+
+        function setupPeerEvents() {
+            peer.on('open', (id) => {
+                myId = id;
+                // Host flow: Move to display ID after successful Peer opening
+                if (currentView === 'host_display') {
+                    render(); // Re-render to show generated ID and video
+                }
+                updateStatus(`Peer ID 생성 완료: ${myId}`, 'success');
+            });
+
+            // Host: Listen for incoming MediaConnection (Call)
+            peer.on('call', (call) => {
+                updateStatus(`Host: ${call.peer}로부터 영상 통화 수신 중...`, 'warning');
+                // Answer the incoming call and send our stream
+                call.answer(myStream);
+                handleCall(call);
+            });
+            
+            // Host: Listen for incoming DataConnection (File/Data)
+            peer.on('connection', (conn) => {
+                updateStatus(`Host: ${conn.peer}로부터 데이터 연결 수신 중...`, 'warning');
+                setupDataConnectionEvents(conn);
+            });
+
+
+            peer.on('error', (err) => {
+                console.error("PeerJS Error:", err);
+                showModal("PeerJS 오류", "PeerJS 연결에 오류가 발생했습니다: " + err.message, true);
+                resetApp();
+            });
+
+            peer.on('disconnected', () => {
+                updateStatus("PeerJS 서버와 연결이 끊겼습니다. 재연결을 시도합니다...", 'warning');
+                // The PeerJS library often handles automatic reconnection, but good to log.
+            });
+        }
+
+        function handleCall(call) {
+            remoteId = call.peer; // Store remote ID
+            
+            call.on('stream', (stream) => {
+                remoteStream = stream;
+                // Only switch to chat view if data channel is also established, or if we are the host and the client initiated both.
+                // For simplicity, switch to chat view as soon as the video connection is established.
+                setCurrentView('chat'); 
+            });
+
+            call.on('close', () => {
+                updateStatus("상대방이 연결을 끊었습니다.", 'info');
+                resetApp();
+            });
+            
+            call.on('error', (err) => {
+                 console.error("Call Error:", err);
+                 showModal("통화 오류", "화상 통화 중 오류가 발생했습니다: " + err.message, true);
+            });
+        }
+
+
+        async function startHostFlow() {
+            const mediaStream = await getMedia();
+            if (!mediaStream) return;
+
+            setCurrentView('host_display');
+            updateStatus("Host ID 생성 중...", 'info');
+
+            // Initialize PeerJS without specifying an ID (let PeerJS generate one)
+            peer = new Peer(undefined, peerConfig);
+            setupPeerEvents();
+        }
+
+        async function connectToHost() {
+            const remoteIdInput = document.getElementById('remote-id-input');
+            const targetId = remoteIdInput.value.trim();
+
+            if (!targetId) {
+                updateStatus("연결할 Host ID를 입력해주세요.", 'error');
+                return;
+            }
+
+            remoteId = targetId;
+
+            const mediaStream = await getMedia();
+            if (!mediaStream) return;
+
+            // Display loading state
+            document.getElementById('connect-btn-text').textContent = "연결 중...";
+            updateStatus(`Host ID (${targetId})에 연결 중...`, 'warning');
+
+            // Initialize PeerJS with a generated ID
+            peer = new Peer(undefined, peerConfig);
+            setupPeerEvents();
+
+            peer.on('open', (id) => {
+                myId = id;
+                
+                // 1. Initiate the DataConnection (for file sharing)
+                const conn = peer.connect(targetId);
+                setupDataConnectionEvents(conn); // Set up connection events immediately
+
+                // 2. Initiate the MediaConnection (Call)
+                const call = peer.call(targetId, myStream);
+                if (call) {
+                    updateStatus(`전화 걸기 성공. Host가 응답하기를 기다리는 중...`, 'warning');
+                    handleCall(call);
+                } else {
+                    updateStatus(`오류: ID ${targetId}에 대한 연결을 시작할 수 없습니다.`, 'error');
+                    resetApp();
+                }
+            });
+        }
+
+        // --- Initialization ---
+        window.onload = function() {
+            render();
+        }
+    </script>
+</body>
+</html>
